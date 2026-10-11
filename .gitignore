@@ -1,0 +1,7 @@
+/build/
+/build-wsl/
+/sdkconfig
+/sdkconfig.old
+/third_party/
+/tests/.build/
+__pycache__/
