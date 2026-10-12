@@ -11,7 +11,7 @@ namespace app {
 struct Config {
     std::string hostname = "serial-dongle", ip = "192.168.1.50", mask = "255.255.255.0",
                 gateway = "192.168.1.1", dns = "192.168.1.1";
-    bool dhcp = true, telnet = false, ssh = true;
+    bool dhcp = true, telnet = false, ssh = true, web_tls = true;
     int vlan = 0, web_port = 443, ssh_port = 22, telnet_port = 23;
     int baud = 115200, data_bits = 8, stop_bits = 1;
     std::string parity = "none";
@@ -53,7 +53,6 @@ bool auth_allowed();
 void auth_failed();
 std::string secret_read(const char* key);
 bool secret_write(const char* key, const std::string& value);
-bool tls_import(const std::string& cert, const std::string& key, std::string& error);
 void identity_init();
 bool factory_reset();
 void network_start();

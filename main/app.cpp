@@ -2,6 +2,7 @@
 #include "bootloader_random.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "ota.hpp"
 
 namespace app {
 knife::Gate gate;
@@ -38,6 +39,7 @@ extern "C" void app_main() {
     app::boot_id = app::random_hex(8);
     app::config_init();
     app::running = app::config();
+    app::firmware_validation_start();
     app::identity_init();
     app::serial_start();
     app::storage_start();

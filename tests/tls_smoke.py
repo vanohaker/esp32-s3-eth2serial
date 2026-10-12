@@ -7,17 +7,21 @@ import argparse
 import ipaddress
 import socket
 import ssl
+from pathlib import Path
 
 from playwright.sync_api import Error, expect, sync_playwright
 
 
-def check(host, port, hostname):
+def check(host, port, hostname, expected_cert=None):
     # Capture the public certificate, then trust only it in a separate test
     # context to verify its signature, dates, server purpose and DNS identity.
     context = ssl._create_unverified_context()
     with socket.create_connection((host, port), timeout=10) as raw:
         with context.wrap_socket(raw, server_hostname=host) as tls:
             pem = ssl.DER_cert_to_PEM_cert(tls.getpeercert(binary_form=True))
+    if expected_cert:
+        assert ssl.PEM_cert_to_DER_cert(pem) == ssl.PEM_cert_to_DER_cert(expected_cert.read_text()), \
+            "The device is not serving the certificate embedded by this build"
     trusted = ssl.create_default_context(cadata=pem)
     trusted.hostname_checks_common_name = False
     with socket.create_connection((host, port), timeout=10) as raw:
@@ -53,5 +57,6 @@ if __name__ == "__main__":
     parser.add_argument("--host", required=True, type=ipaddress.IPv4Address)
     parser.add_argument("--port", type=int, default=443)
     parser.add_argument("--hostname", required=True)
+    parser.add_argument("--expected-cert", type=Path, help="Public certificate used to build the firmware")
     args = parser.parse_args()
-    check(str(args.host), args.port, args.hostname)
+    check(str(args.host), args.port, args.hostname, args.expected_cert)

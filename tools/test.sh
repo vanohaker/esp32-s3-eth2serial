@@ -7,3 +7,6 @@ g++ -std=c++20 -Wall -Wextra -Werror -pthread -fsanitize=address,undefined \
   components/knife_core/core.cpp tests/core_test.cpp -o tests/.build/core_test
 tests/.build/core_test
 node --check main/web/app.js
+python3 tests/version_test.py
+python3 tests/tls_identity_test.py
+python3 tests/signing_identity_test.py

@@ -1,15 +1,12 @@
 #include "app.hpp"
-#include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "mbedtls/base64.h"
 #include "mbedtls/md.h"
-#include "mbedtls/oid.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/pkcs5.h"
-#include "mbedtls/x509_crt.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include <algorithm>
@@ -79,6 +76,7 @@ static cJSON* config_json(const Config& c) {
     B(dhcp);
     B(telnet);
     B(ssh);
+    B(web_tls);
     N(vlan);
     N(web_port);
     N(ssh_port);
@@ -139,6 +137,7 @@ static bool read_config(cJSON* j, Config& c, std::string& error) {
     boolean("dhcp", c.dhcp);
     boolean("telnet", c.telnet);
     boolean("ssh", c.ssh);
+    boolean("web_tls", c.web_tls);
     num("vlan", c.vlan, 0, 4094);
     num("web_port", c.web_port, 1, 65535);
     num("ssh_port", c.ssh_port, 1, 65535);
@@ -216,6 +215,7 @@ void config_init() {
                         ? ESP_OK
                         : ESP_FAIL);
     cJSON* item = nullptr;
+    bool repaired_admin = false;
     cJSON_ArrayForEach(item, cJSON_GetObjectItemCaseSensitive(root.p, "users")) {
         User u;
         u.name = field(item, "name");
@@ -223,12 +223,18 @@ void config_init() {
         u.hash = field(item, "hash");
         u.public_key = field(item, "public_key");
         u.enabled = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item, "enabled"));
+        if (u.name == "admin" && !u.enabled) {
+            u.enabled = true;
+            repaired_admin = true;
+        }
         users.push_back(u);
     }
     ESP_ERROR_CHECK(!users.empty() && users.size() <= 8 &&
                             std::any_of(users.begin(), users.end(), [](auto& u) { return u.enabled; })
                         ? ESP_OK
                         : ESP_FAIL);
+    if (repaired_admin)
+        ESP_ERROR_CHECK(persist(saved, users) ? ESP_OK : ESP_FAIL);
 }
 bool save_settings(cJSON* j, std::string& error) {
     knife::Lease lease(gate, knife::Write);
@@ -293,6 +299,16 @@ bool save_user(cJSON* j, bool remove, std::string& error) {
         return false;
     }
     auto it = std::find_if(list.begin(), list.end(), [&](auto& u) { return u.name == name; });
+    // A username is the immutable identity. Creating and updating are explicit,
+    // so changing a form field cannot silently create another account.
+    if (cJSON_HasObjectItem(j, "new_name") || cJSON_HasObjectItem(j, "old_name")) {
+        error = "Renaming users is not supported";
+        return false;
+    }
+    if (name == "admin" && remove) {
+        error = "Cannot delete admin";
+        return false;
+    }
     if (remove) {
         if (it == list.end()) {
             error = "Unknown user";
@@ -300,7 +316,25 @@ bool save_user(cJSON* j, bool remove, std::string& error) {
         }
         list.erase(it);
     } else {
-        bool created = it == list.end();
+        auto operation = field(j, "operation");
+        if (operation != "create" && operation != "update") {
+            error = "Expected operation create or update";
+            return false;
+        }
+        bool created = operation == "create";
+        if (created == (it != list.end())) {
+            error = created ? "User already exists" : "Unknown user";
+            return false;
+        }
+        auto enabled = cJSON_GetObjectItemCaseSensitive(j, "enabled");
+        if (enabled && !cJSON_IsBool(enabled)) {
+            error = "Invalid enabled flag";
+            return false;
+        }
+        if (name == "admin" && enabled && !cJSON_IsTrue(enabled)) {
+            error = "Cannot disable admin";
+            return false;
+        }
         if (created) {
             if (list.size() >= 8) {
                 error = "Maximum 8 users";
@@ -323,12 +357,7 @@ bool save_user(cJSON* j, bool remove, std::string& error) {
                 return false;
             }
         }
-        auto enabled = cJSON_GetObjectItemCaseSensitive(j, "enabled");
         if (enabled) {
-            if (!cJSON_IsBool(enabled)) {
-                error = "Invalid enabled flag";
-                return false;
-            }
             it->enabled = cJSON_IsTrue(enabled);
         }
         auto key = cJSON_GetObjectItemCaseSensitive(j, "public_key");
@@ -408,135 +437,11 @@ static std::string generate_key() {
     ESP_ERROR_CHECK(rc == 0 ? ESP_OK : ESP_FAIL);
     return reinterpret_cast<char*>(pem);
 }
-static bool empty_extensions(const mbedtls_x509_crt& crt) {
-    // Mbed TLS accepts an explicitly present empty Extensions SEQUENCE, but
-    // RFC 5280 requires SIZE (1..MAX), and Chromium correctly rejects it.
-    return crt.v3_ext.p && crt.v3_ext.len == 2 && crt.v3_ext.p[0] == 0x30 && crt.v3_ext.p[1] == 0;
-}
-static bool legacy_generated_certificate(const std::string& pem) {
-    mbedtls_x509_crt crt;
-    mbedtls_x509_crt_init(&crt);
-    int rc = mbedtls_x509_crt_parse(&crt, reinterpret_cast<const uint8_t*>(pem.c_str()), pem.size() + 1);
-    auto date_is = [](const mbedtls_x509_time& t, int year) {
-        return t.year == year && t.mon == 1 && t.day == 1 && t.hour == 0 && t.min == 0 && t.sec == 0;
-    };
-    // Migrate only the malformed profile emitted by the original prototype.
-    // In particular, do not renew or replace valid imported certificates.
-    bool legacy = !rc && !crt.next && crt.version == 3 && empty_extensions(crt) && crt.serial.len == 16 &&
-                  mbedtls_pk_get_type(&crt.pk) == MBEDTLS_PK_ECKEY && date_is(crt.valid_from, 2026) &&
-                  date_is(crt.valid_to, 2046) && crt.subject_raw.len == crt.issuer_raw.len &&
-                  memcmp(crt.subject_raw.p, crt.issuer_raw.p, crt.subject_raw.len) == 0 &&
-                  !crt.subject.next && MBEDTLS_OID_CMP(MBEDTLS_OID_AT_CN, &crt.subject.oid) == 0;
-    mbedtls_x509_crt_free(&crt);
-    return legacy;
-}
-bool tls_import(const std::string& cert, const std::string& key, std::string& error) {
-    knife::Lease lease(gate, knife::Write);
-    if (!lease) {
-        error = "Busy";
-        return false;
-    }
-    mbedtls_x509_crt crt;
-    mbedtls_x509_crt_init(&crt);
-    mbedtls_pk_context pk;
-    mbedtls_pk_init(&pk);
-    int rc = mbedtls_x509_crt_parse(&crt, reinterpret_cast<const uint8_t*>(cert.c_str()), cert.size() + 1);
-    if (!rc)
-        for (auto item = &crt; item; item = item->next)
-            if (empty_extensions(*item)) {
-                mbedtls_x509_crt_free(&crt);
-                mbedtls_pk_free(&pk);
-                error = "Certificate contains an invalid empty X.509 Extensions sequence";
-                return false;
-            }
-    if (!rc)
-        rc = mbedtls_pk_parse_key(&pk, reinterpret_cast<const uint8_t*>(key.c_str()), key.size() + 1, nullptr,
-                                  0, rng, nullptr);
-    if (!rc)
-        rc = mbedtls_pk_check_pair(&crt.pk, &pk, rng, nullptr);
-    mbedtls_x509_crt_free(&crt);
-    mbedtls_pk_free(&pk);
-    if (rc) {
-        error = "Certificate/private key invalid or do not match";
-        return false;
-    }
-    Json j(cJSON_CreateObject());
-    cJSON_AddStringToObject(j.p, "cert", cert.c_str());
-    cJSON_AddStringToObject(j.p, "key", key.c_str());
-    if (!secret_write("tls", json_text(j.p))) {
-        error = "NVS write failed";
-        return false;
-    }
-    return true;
-}
 void identity_init() {
     if (secret_read("ssh_key").empty())
         ESP_ERROR_CHECK(secret_write("ssh_key", generate_key()) ? ESP_OK : ESP_FAIL);
-    auto stored = secret_read("tls");
-    std::string key;
-    if (!stored.empty()) {
-        Json identity(cJSON_Parse(stored.c_str()));
-        if (!legacy_generated_certificate(field(identity.p, "cert")))
-            return;
-        key = field(identity.p, "key");
-        ESP_LOGW("tls", "Replacing legacy certificate with empty extensions; preserving private key");
-    }
-    if (key.empty())
-        key = generate_key();
-    mbedtls_pk_context pk;
-    mbedtls_pk_init(&pk);
-    ESP_ERROR_CHECK(mbedtls_pk_parse_key(&pk, reinterpret_cast<const uint8_t*>(key.c_str()), key.size() + 1,
-                                         nullptr, 0, rng, nullptr) == 0
-                        ? ESP_OK
-                        : ESP_FAIL);
-    mbedtls_x509write_cert crt;
-    mbedtls_x509write_crt_init(&crt);
-    mbedtls_x509write_crt_set_version(&crt, MBEDTLS_X509_CRT_VERSION_3);
-    mbedtls_x509write_crt_set_md_alg(&crt, MBEDTLS_MD_SHA256);
-    mbedtls_x509write_crt_set_subject_key(&crt, &pk);
-    mbedtls_x509write_crt_set_issuer_key(&crt, &pk);
-    auto settings = config();
-    std::string subject = "CN=" + settings.hostname;
-    ESP_ERROR_CHECK(mbedtls_x509write_crt_set_subject_name(&crt, subject.c_str()) == 0 ? ESP_OK : ESP_FAIL);
-    ESP_ERROR_CHECK(mbedtls_x509write_crt_set_issuer_name(&crt, subject.c_str()) == 0 ? ESP_OK : ESP_FAIL);
-    unsigned char serial[16];
-    esp_fill_random(serial, sizeof(serial));
-    serial[0] &= 0x7f;
-    serial[0] |= 1;
-    ESP_ERROR_CHECK(mbedtls_x509write_crt_set_serial_raw(&crt, serial, sizeof(serial)) == 0 ? ESP_OK
-                                                                                            : ESP_FAIL);
-    ESP_ERROR_CHECK(mbedtls_x509write_crt_set_validity(&crt, "20260101000000", "20460101000000") == 0
-                        ? ESP_OK
-                        : ESP_FAIL);
-    ESP_ERROR_CHECK(mbedtls_x509write_crt_set_basic_constraints(&crt, 0, -1) == 0 ? ESP_OK : ESP_FAIL);
-    ESP_ERROR_CHECK(mbedtls_x509write_crt_set_key_usage(&crt, MBEDTLS_X509_KU_DIGITAL_SIGNATURE) == 0
-                        ? ESP_OK
-                        : ESP_FAIL);
-    mbedtls_asn1_sequence usage{};
-    usage.buf.tag = MBEDTLS_ASN1_OID;
-    usage.buf.p = reinterpret_cast<unsigned char*>(const_cast<char*>(MBEDTLS_OID_SERVER_AUTH));
-    usage.buf.len = MBEDTLS_OID_SIZE(MBEDTLS_OID_SERVER_AUTH);
-    ESP_ERROR_CHECK(mbedtls_x509write_crt_set_ext_key_usage(&crt, &usage) == 0 ? ESP_OK : ESP_FAIL);
-    mbedtls_x509_san_list dns{}, ip{};
-    dns.node.type = MBEDTLS_X509_SAN_DNS_NAME;
-    dns.node.san.unstructured_name.p = reinterpret_cast<unsigned char*>(settings.hostname.data());
-    dns.node.san.unstructured_name.len = settings.hostname.size();
-    // DHCP has not supplied an address at this point. Never certify the unused
-    // fallback IP as though it were the active DHCP address.
-    in_addr address{};
-    if (!settings.dhcp && inet_pton(AF_INET, settings.ip.c_str(), &address) == 1) {
-        ip.node.type = MBEDTLS_X509_SAN_IP_ADDRESS;
-        ip.node.san.unstructured_name.p = reinterpret_cast<unsigned char*>(&address.s_addr);
-        ip.node.san.unstructured_name.len = sizeof(address.s_addr);
-        dns.next = &ip;
-    }
-    ESP_ERROR_CHECK(mbedtls_x509write_crt_set_subject_alternative_name(&crt, &dns) == 0 ? ESP_OK : ESP_FAIL);
-    unsigned char pem[4096]{};
-    ESP_ERROR_CHECK(mbedtls_x509write_crt_pem(&crt, pem, sizeof(pem), rng, nullptr) == 0 ? ESP_OK : ESP_FAIL);
-    mbedtls_x509write_crt_free(&crt);
-    mbedtls_pk_free(&pk);
-    std::string error;
-    ESP_ERROR_CHECK(tls_import(reinterpret_cast<char*>(pem), key, error) ? ESP_OK : ESP_FAIL);
+    // HTTPS uses the identity embedded in the application. Legacy NVS TLS data
+    // is ignored and left intact for rollback to an older firmware.
 }
 bool factory_reset() {
     return nvs_erase_all(nvs) == ESP_OK && nvs_commit(nvs) == ESP_OK;

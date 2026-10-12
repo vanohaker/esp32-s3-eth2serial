@@ -18,6 +18,22 @@ static void gate_tests() {
     assert(!gate.acquire(Write));
     gate.release(Uart);
     assert(gate.state() == Shutdown);
+    Gate update;
+    assert(update.acquire(Uart));
+    assert(!update.acquire(Update));
+    update.release(Uart);
+    assert(update.acquire(Update));
+    for (unsigned resource : {Uart, Card, Write, Transfer, Update})
+        assert(!update.acquire(resource));
+    assert(!update.shutdown());
+    assert(update.finish_update());
+    assert(update.state() == Shutdown);
+    assert(!update.acquire(Card));
+    Gate failed;
+    assert(failed.acquire(Update));
+    failed.release(Update);
+    assert(failed.acquire(Write));
+    assert(!failed.finish_update());
     Gate concurrent;
     std::barrier ready(9), hold(9);
     std::atomic<int> winners{0};

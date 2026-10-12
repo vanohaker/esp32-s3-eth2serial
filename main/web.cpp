@@ -1,8 +1,11 @@
 #include "app.hpp"
+#include "build_version.h"
 #include "esp_https_server.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "ota.hpp"
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -15,6 +18,10 @@ extern const unsigned char js_start[] asm("_binary_app_js_start");
 extern const unsigned char js_end[] asm("_binary_app_js_end");
 extern const unsigned char css_start[] asm("_binary_style_css_start");
 extern const unsigned char css_end[] asm("_binary_style_css_end");
+extern const unsigned char cert_start[] asm("_binary_https_cert_pem_start");
+extern const unsigned char cert_end[] asm("_binary_https_cert_pem_end");
+extern const unsigned char key_start[] asm("_binary_https_key_pem_start");
+extern const unsigned char key_end[] asm("_binary_https_key_pem_end");
 
 namespace app {
 struct Session {
@@ -116,7 +123,7 @@ static esp_err_t login(httpd_req_t* r) {
 static esp_err_t status(httpd_req_t* r) {
     auto j = cJSON_CreateObject();
     auto c = running;
-    cJSON_AddStringToObject(j, "version", "0.1.0");
+    cJSON_AddStringToObject(j, "version", KNIFE_BUILD_VERSION);
     cJSON_AddStringToObject(j, "boot_id", boot_id.c_str());
     cJSON_AddStringToObject(j, "hostname", c.hostname.c_str());
     cJSON_AddStringToObject(j, "ip", ip_address().c_str());
@@ -132,6 +139,7 @@ static esp_err_t status(httpd_req_t* r) {
     cJSON_AddBoolToObject(j, "ssh", ssh_ready);
     cJSON_AddBoolToObject(j, "telnet", telnet_ready);
     cJSON_AddNumberToObject(j, "web_port", c.web_port);
+    cJSON_AddBoolToObject(j, "web_tls", c.web_tls);
     cJSON_AddNumberToObject(j, "ssh_port", c.ssh_port);
     cJSON_AddNumberToObject(j, "telnet_port", c.telnet_port);
     cJSON_AddStringToObject(j, "transfer_protocols", "XMODEM, YMODEM");
@@ -188,6 +196,10 @@ static esp_err_t get_handler(httpd_req_t* r) {
     if (path == "/api/health") {
         auto j = cJSON_CreateObject();
         cJSON_AddStringToObject(j, "boot_id", boot_id.c_str());
+        cJSON_AddStringToObject(j, "version", KNIFE_BUILD_VERSION);
+        cJSON_AddStringToObject(j, "image_id", firmware_image_id().c_str());
+        cJSON_AddStringToObject(j, "ota_state", firmware_state());
+        cJSON_AddStringToObject(j, "ota_partition", esp_ota_get_running_partition()->label);
         return json_response(r, j);
     }
     if (path.rfind("/api/", 0) != 0) {
@@ -228,14 +240,54 @@ static esp_err_t get_handler(httpd_req_t* r) {
     }
     return message(r, "Not found", "404 Not Found");
 }
+static esp_err_t update_firmware(httpd_req_t* r) {
+    auto reject = [&](const std::string& error, const char* status) {
+        // Close after a rejection, since a partially read binary body may remain.
+        message(r, error, status);
+        return ESP_FAIL;
+    };
+    knife::Lease lease(gate, knife::Update);
+    if (!lease)
+        return reject("Устройство занято. Закройте serial-сессию и завершите файловые операции",
+                      "409 Conflict");
+    FirmwareUpdate update;
+    std::string error;
+    if (!firmware_receive(
+            r->content_len,
+            [r](uint8_t* data, size_t size) {
+                return httpd_req_recv(r, reinterpret_cast<char*>(data), size);
+            },
+            update, error))
+        return reject(error, "400 Bad Request");
+    if (esp_ota_set_boot_partition(update.partition) != ESP_OK)
+        return reject("Не удалось выбрать новую прошивку для запуска", "500 Internal Server Error");
+    if (!gate.finish_update())
+        abort(); // Update lease must be exclusive; never release it before reboot.
+    lease.held = false;
+    if (!schedule_restart()) {
+        if (esp_ota_set_boot_partition(esp_ota_get_running_partition()) != ESP_OK)
+            esp_restart(); // Do not report a cancelled update with a new boot selection left active.
+        gate.release(knife::Shutdown);
+        return reject("Не удалось запланировать перезагрузку", "500 Internal Server Error");
+    }
+    auto j = cJSON_CreateObject();
+    cJSON_AddStringToObject(j, "message", "Подпись проверена. Перезагрузка для установки обновления");
+    cJSON_AddStringToObject(j, "image_id", update.image_id.c_str());
+    cJSON_AddStringToObject(j, "ota_partition", update.partition->label);
+    return json_response(r, j, "202 Accepted");
+}
 static esp_err_t post_handler(httpd_req_t* r) {
     std::string path = r->uri;
     if (path == "/api/login")
         return login(r);
-    if (!authorized(r))
-        return message(r, "Authentication required", "401 Unauthorized");
+    if (!authorized(r)) {
+        auto sent = message(r, "Authentication required", "401 Unauthorized");
+        return path == "/api/firmware" ? ESP_FAIL : sent;
+    }
     if (gate.state() & knife::Shutdown)
         return message(r, "Restart in progress", "503 Service Unavailable");
+    if (path == "/api/firmware")
+        return update_firmware(r);
     if (path.rfind("/api/upload?", 0) == 0)
         return upload(r);
     std::string body;
@@ -261,10 +313,6 @@ static esp_err_t post_handler(httpd_req_t* r) {
     } else if (path == "/api/logout") {
         invalidate_sessions();
         return message(r, "Signed out on all browsers");
-    } else if (path == "/api/tls") {
-        ok = tls_import(field(j.p, "cert"), field(j.p, "key"), error);
-        if (ok)
-            return message(r, "TLS identity saved. Restart to activate.");
     } else if (path == "/api/transfer") {
         auto protocol = field(j.p, "protocol");
         if (protocol != "xmodem" && protocol != "ymodem")
@@ -308,10 +356,10 @@ static esp_err_t post_handler(httpd_req_t* r) {
     return message(r, error, "409 Conflict");
 }
 void web_start() {
-    Json identity(cJSON_Parse(secret_read("tls").c_str()));
-    static std::string cert = field(identity.p, "cert"), key = field(identity.p, "key");
     httpd_ssl_config_t cfg = HTTPD_SSL_CONFIG_DEFAULT();
+    cfg.transport_mode = running.web_tls ? HTTPD_SSL_TRANSPORT_SECURE : HTTPD_SSL_TRANSPORT_INSECURE;
     cfg.port_secure = running.web_port;
+    cfg.port_insecure = running.web_port;
     cfg.httpd.stack_size = 16384;
     cfg.httpd.max_uri_handlers = 3;
     cfg.httpd.max_open_sockets = 4;
@@ -319,10 +367,10 @@ void web_start() {
     cfg.httpd.recv_wait_timeout = 5;
     cfg.httpd.send_wait_timeout = 5;
     cfg.httpd.uri_match_fn = httpd_uri_match_wildcard;
-    cfg.servercert = reinterpret_cast<const uint8_t*>(cert.c_str());
-    cfg.servercert_len = cert.size() + 1;
-    cfg.prvtkey_pem = reinterpret_cast<const uint8_t*>(key.c_str());
-    cfg.prvtkey_len = key.size() + 1;
+    cfg.servercert = cert_start;
+    cfg.servercert_len = cert_end - cert_start;
+    cfg.prvtkey_pem = key_start;
+    cfg.prvtkey_len = key_end - key_start;
     ESP_ERROR_CHECK(httpd_ssl_start(&server, &cfg));
     httpd_uri_t get{};
     get.uri = "/*";

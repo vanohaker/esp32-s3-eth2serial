@@ -18,7 +18,6 @@ static void restart_task(void*) {
 }
 bool schedule_restart() {
     if (xTaskCreate(restart_task, "restart", 3072, nullptr, 3, nullptr) != pdPASS) {
-        gate.release(knife::Shutdown);
         return false;
     }
     return true;
@@ -141,8 +140,8 @@ static bool mail_once(const Config& c) {
             "From: <" + c.mail_from + ">\r\nTo: <" + c.mail_to +
             ">\r\nSubject: Serial dongle started: " + c.hostname +
             "\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=us-ascii\r\n\r\nHostname: " +
-            c.hostname + "\r\nIP: " + ip + "\r\nHTTPS: https://" + ip + ":" + std::to_string(c.web_port) +
-            "/\r\n";
+            c.hostname + "\r\nIP: " + ip + "\r\nWeb: " + (c.web_tls ? "https://" : "http://") + ip + ":" +
+            std::to_string(c.web_port) + "/\r\n";
         body +=
             "SSH: " +
             std::string(ssh_ready ? "enabled port " + std::to_string(c.ssh_port) : "disabled/unavailable") +

@@ -6,7 +6,7 @@ namespace knife {
 bool Gate::acquire(unsigned bits) {
     auto value = state_.load();
     do {
-        if (value & (bits | Shutdown))
+        if ((value & (bits | Shutdown | Update)) || ((bits & Update) && value))
             return false;
     } while (!state_.compare_exchange_weak(value, value | bits));
     return true;
@@ -14,10 +14,14 @@ bool Gate::acquire(unsigned bits) {
 bool Gate::shutdown() {
     auto value = state_.load();
     do {
-        if (value & (Card | Write | Transfer | Shutdown))
+        if (value & (Card | Write | Transfer | Shutdown | Update))
             return false;
     } while (!state_.compare_exchange_weak(value, value | Shutdown));
     return true;
+}
+bool Gate::finish_update() {
+    unsigned expected = Update;
+    return state_.compare_exchange_strong(expected, Shutdown);
 }
 static bool alnum(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');

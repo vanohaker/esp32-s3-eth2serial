@@ -3,5 +3,7 @@
 /sdkconfig
 /sdkconfig.old
 /third_party/
+/.tls/
+/.signing/
 /tests/.build/
 __pycache__/
